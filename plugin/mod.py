@@ -1,8 +1,9 @@
 import liqi_new
 import random
+import json
 from ruamel.yaml import YAML
 from loguru import logger
-from struct import unpack
+from struct import unpack, pack
 from proto import liqi_pb2, basic_pb2
 from google.protobuf import json_format
 
@@ -73,6 +74,36 @@ config:
             yaml = YAML()
             self.max_data = yaml.load(f)
 
+    def _emo_allowed(self, emo_id):
+        # [PATCH] 表情ID公式: emo_id = (charid % 100000) * 10000 + 序号
+        # 已验证: 500000→200050, 10000→200001, 1090000→20000109
+        r = emo_id // 10000
+        sub = emo_id % 10000
+        charid = 20000000 + r if r >= 100 else 200000 + r
+        main = self.safe.get('real_main')
+        if main is None or charid != main:
+            return False
+        if sub <= 8:  # 基础表情（第0~8个）
+            return True
+        return sub in self.safe.get('real_extra', {}).get(charid, set())
+
+    def _emo_fake_frames(self, msg_id, emo_id):
+        # [PATCH] 构造伪造的两帧服务端消息（顺序与真实服务器一致：先Notify后Res）
+        sub = emo_id % 10000
+        notify_data = liqi_pb2.NotifyGameBroadcast()
+        notify_data.content = json.dumps(
+            {'emo': sub, 'emo_id': emo_id}, separators=(',', ':'))
+        notify_data.seat = self.safe.get(
+            'my_seat', self.safe.get('seat_guess', 0))
+        nb = basic_pb2.BaseMessage()
+        nb.method_name = '.lq.NotifyGameBroadcast'
+        nb.data = notify_data.SerializeToString()
+        rb = basic_pb2.BaseMessage()  # 空method_name+空data = 成功响应
+        return [
+            b'\x01' + nb.SerializeToString(),
+            b'\x03' + pack('<H', msg_id) + rb.SerializeToString(),
+        ]
+
     def main(self, message, liqi_proto):
         modify = False
         drop = False
@@ -89,6 +120,18 @@ config:
             msg_block.ParseFromString(buf[1:])
             method_name = msg_block.method_name
             match method_name:
+                case '.lq.NotifyGameBroadcast':  # [PATCH] 表情回显：校准自己的座位号
+                    data = liqi_pb2.NotifyGameBroadcast()
+                    data.ParseFromString(msg_block.data)
+                    try:
+                        _c = json.loads(data.content)
+                    except:
+                        _c = {}
+                    if isinstance(_c, dict) and 'emo_id' in _c:
+                        _pend = self.safe.get('emo_echo_pending')
+                        if _pend and _c['emo_id'] in _pend:
+                            self.safe['my_seat'] = data.seat
+                            _pend.discard(_c['emo_id'])
                 case '.lq.NotifyAccountUpdate':
                     data = liqi_pb2.NotifyAccountUpdate()
                     data.ParseFromString(msg_block.data)
@@ -179,7 +222,7 @@ config:
                         character.rewarded_level.extend([1, 2, 3, 4, 5])
                         if self.settings['config']['emoji']:
                             character.extra_emoji.extend(
-                                self.max_data['emoji'][character.charid])
+                                self.max_data['emoji'].get(character.charid, []))
 
                         basic = basic_pb2.BaseMessage()
                         basic.method_name = '.lq.NotifyAccountUpdate'
@@ -249,12 +292,36 @@ config:
                         self.settings['config']['random_character']['enabled'] = data.enabled
                         self.settings['config']['random_character']['pool'] = json_format.MessageToDict(data, including_default_value_fields=True, preserving_proto_field_name=True)['pool']
                         self.SaveSettings()
+                    case '.lq.FastTest.broadcastInGame':  # [PATCH] 对局表情本地伪造
+                        data = liqi_pb2.ReqBroadcastInGame()
+                        data.ParseFromString(msg_block.data)
+                        try:
+                            content = json.loads(data.content)
+                        except:
+                            content = {}
+                        if isinstance(content, dict) and 'emo_id' in content:
+                            emo_id = int(content['emo_id'])
+                            self.safe.setdefault('emo_blocked', set())
+                            if emo_id in self.safe['emo_blocked'] or not self._emo_allowed(emo_id):
+                                # 不让请求出网，本地伪造服务端响应（Notify + 成功Res）
+                                drop = True
+                                inject = True
+                                inject_msg = self._emo_fake_frames(msg_id, emo_id)
+                                logger.warning(
+                                    f"[表情伪造] 拦截未拥有表情 emo_id={emo_id}，座位={self.safe.get('my_seat', self.safe.get('seat_guess', 0))}，本地回显（请求不出网）")
+                            else:
+                                # 真实拥有的表情，放行给服务器，用于回显校准座位
+                                self.safe.setdefault(
+                                    'emo_pending_req', {})[msg_id] = emo_id
+                                self.safe.setdefault(
+                                    'emo_echo_pending', set()).add(emo_id)
 
 
                 if fake:
                     modify = True
                     data = liqi_pb2.ReqLoginBeat()
-                    data.contract = self.contract
+                    # [PATCH] 容器重启后 self.contract 可能尚未初始化，加默认值兜底
+                    data.contract = getattr(self, 'contract', 0)
                     msg_block.method_name = '.lq.Lobby.loginBeat'
             elif msg_type == liqi_new.MsgType.Res:
                 # Res类型必定是客户端收到的消息
@@ -264,12 +331,27 @@ config:
                 method_name, liqi_pb2_res = liqi_proto.res_type[msg_id]
                 # 根据method_name判断是否需要修改
                 match method_name:
+                    case '.lq.FastTest.broadcastInGame':  # [PATCH] 记录被服务器拒绝的表情，下次本地伪造
+                        emo_id = self.safe.get('emo_pending_req', {}).pop(msg_id, None)
+                        data = liqi_pb2.ResCommon()
+                        data.ParseFromString(msg_block.data)
+                        if data.error.code == 2208 and emo_id is not None:
+                            self.safe.setdefault('emo_blocked', set()).add(emo_id)
+                            _pend = self.safe.get('emo_echo_pending')
+                            if _pend:
+                                _pend.discard(emo_id)
+                            logger.warning(
+                                f"[表情伪造] 服务器拒绝过表情 emo_id={emo_id}，已加入拦截名单")
                     case '.lq.Lobby.fetchCharacterInfo':  # 获取角色和皮肤信息
                         modify = True
                         data = liqi_pb2.ResCharacterInfo()
                         data.ParseFromString(msg_block.data)
                         self.safe['main_character_id'] = data.main_character_id
                         self.safe['characters'] = data.characters
+                        # [PATCH] 记录服务器真实数据（纯值拷贝，避免protobuf引用失效）
+                        self.safe['real_main'] = data.main_character_id
+                        self.safe['real_extra'] = {
+                            c.charid: set(c.extra_emoji) for c in data.characters}
                         # self.safe['skins'] = data.skins
                         # self.safe['character_sort'] = data.character_sort
                         # START
@@ -289,7 +371,7 @@ config:
                             character.skin = self.settings['config']['characters'][c]
                             if self.settings['config']['emoji']:
                                 character.extra_emoji.extend(
-                                    self.max_data['emoji'][character.charid])
+                                    self.max_data['emoji'].get(character.charid, []))
                         data.ClearField('skins')
                         data.skins.extend(self.max_data['skin'])
                         data.main_character_id = self.settings['config']['character']
@@ -347,7 +429,7 @@ config:
                                     'characters'][self.settings['config']['character']]
                                 if self.settings['config']['emoji']:
                                     p.character.extra_emoji.extend(
-                                        self.max_data['emoji'][p.character.charid])
+                                        self.max_data['emoji'].get(p.character.charid, []))
                                 if self.settings['config']['nickname'] != '':
                                     p.nickname = self.settings['config']['nickname']
                                 p.title = self.settings['config']['title']
@@ -373,12 +455,19 @@ config:
                             elif data.game_config.meta.mode_id == 26:
                                 data.game_config.meta.mode_id =24
                     
-                        for p in data.players:
+                        for _idx, p in enumerate(data.players):
                             p.character.level = 5
                             p.character.is_upgraded = True
                             p.character.rewarded_level.extend([1, 2, 3, 4, 5])
                             p.character.exp = 0
                             if p.account_id == self.safe['account_id']:
+                                # [PATCH] seat_list[座位]=该座位的account_id（如[11,12,我的id,13]），
+                                # 自己账号在列表中的下标才是真实座位；并清除旧对局学到的座位
+                                _sl = list(data.seat_list)
+                                _aid = self.safe['account_id']
+                                self.safe['seat_guess'] = _sl.index(
+                                    _aid) if _aid in _sl else _idx
+                                self.safe.pop('my_seat', None)
                                 if self.settings['config']['random_character']['enabled'] and self.settings['config']['random_character']['pool']!=[]: # 处理随机角色
                                     item = random.choice(self.settings['config']['random_character']['pool'])
                                     p.character.charid = item['character_id']
@@ -388,7 +477,7 @@ config:
                                     p.avatar_id = p.character.skin = self.settings['config']['characters'][self.settings['config']['character']]
                                 if self.settings['config']['emoji']:
                                     p.character.extra_emoji.extend(
-                                        self.max_data['emoji'][p.character.charid])
+                                        self.max_data['emoji'].get(p.character.charid, []))
                                 if self.settings['config']['nickname'] != '':
                                     p.nickname = self.settings['config']['nickname']
                                 p.title = self.settings['config']['title']
@@ -471,7 +560,7 @@ config:
                                     'characters'][self.settings['config']['character']]
                                 if self.settings['config']['emoji']:
                                     p.character.extra_emoji.extend(
-                                        self.max_data['emoji'][p.character.charid])
+                                        self.max_data['emoji'].get(p.character.charid, []))
                                 if self.settings['config']['nickname'] != '':
                                     p.nickname = self.settings['config']['nickname']
                                 p.title = self.settings['config']['title']
@@ -555,7 +644,7 @@ config:
                             character.skin = self.settings['config']['characters'][c]
                             if self.settings['config']['emoji']:
                                 character.extra_emoji.extend(
-                                    self.max_data['emoji'][character.charid])
+                                    self.max_data['emoji'].get(character.charid, []))
                         data.character_info.ClearField('skins')
                         data.character_info.skins.extend(
                             self.max_data['skin'])
@@ -646,7 +735,7 @@ config:
 
                                 if self.settings['config']['emoji']:
                                     account.character.extra_emoji.extend(
-                                        self.max_data['emoji'][account.character.charid])
+                                        self.max_data['emoji'].get(account.character.charid, []))
                                 if self.settings['config']['nickname'] != '':
                                     account.nickname = self.settings['config']['nickname']
                                 account.title = self.settings['config']['title']

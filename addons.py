@@ -112,9 +112,12 @@ class MajsoulMaxAddon:
                 if drop: 
                     message.drop()
                 if inject:
-                    ctx.master.commands.call(
-                        "inject.websocket", flow, True, inject_msg, False
-                    )
+                    # [PATCH] 支持一次注入多帧（表情伪造需要 Notify + Res 两帧）
+                    frames = inject_msg if isinstance(inject_msg, list) else [inject_msg]
+                    for frame in frames:
+                        ctx.master.commands.call(
+                            "inject.websocket", flow, True, frame, False
+                        )
                 if modify:
                     # 如果被mod修改就同步变更
                     message.content = msg
